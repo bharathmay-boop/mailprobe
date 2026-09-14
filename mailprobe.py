@@ -10,6 +10,7 @@ import argparse
 import concurrent.futures
 import http.server
 import json
+import os
 import re
 import secrets
 import smtplib
@@ -19,14 +20,21 @@ import threading
 import webbrowser
 from dataclasses import asdict, dataclass
 
+import dns.exception
 import dns.resolver
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 VALID = "valid"
 INVALID = "invalid"
 RISKY = "risky"
 UNKNOWN = "unknown"
+
+# Used when the caller gives us nothing better. example.com is reserved and
+# cannot send or receive mail, so some servers refuse it. main() warns when
+# this is still in place.
+DEFAULT_FROM = "verify@example.com"
+FROM_ENV_VAR = "MAILPROBE_FROM"
 
 # RFC 5321 caps the local part at 64 characters and the whole address at 254.
 MAX_LOCAL = 64
@@ -76,6 +84,41 @@ class Result:
     role: bool = False
 
 
+def default_from_address() -> str:
+    """The sending address to introduce ourselves with.
+
+    Reads MAILPROBE_FROM so anyone installing this can set their own domain
+    once instead of passing it on every run.
+    """
+    return os.environ.get(FROM_ENV_VAR, "").strip() or DEFAULT_FROM
+
+
+def helo_name(from_address: str) -> str:
+    """The name we announce ourselves as when greeting a mail server.
+
+    The standard library would use this computer's hostname, which on most
+    machines is something like "laptop" or "DESKTOP-ABC123". That is not a
+    domain name, and plenty of mail servers refuse to talk to a sender that
+    greets them with one. The domain of the sending address is both correct
+    and something the user can control.
+    """
+    domain = from_address.rpartition("@")[2].strip()
+    return domain if "." in domain else "localhost"
+
+
+def format_error(email: str) -> str | None:
+    """Explain why an address is malformed, or return None if it looks fine."""
+    if not email:
+        return "no address given"
+    if len(email) > MAX_TOTAL:
+        return "the address is too long"
+    if not _SYNTAX.match(email):
+        return "not a valid email address format"
+    if len(email.rpartition("@")[0]) > MAX_LOCAL:
+        return "the part before the @ is too long"
+    return None
+
+
 def find_mx(domain: str, timeout: float = 10.0) -> tuple[str | None, str]:
     """Return the best mail host for a domain, and a note explaining the lookup.
 
@@ -94,7 +137,7 @@ def find_mx(domain: str, timeout: float = 10.0) -> tuple[str | None, str]:
         return None, "domain does not exist"
     except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
         pass
-    except (dns.resolver.LifetimeTimeout, dns.exception.Timeout):
+    except dns.exception.Timeout:
         return None, "dns lookup timed out"
     except dns.exception.DNSException:
         return None, "dns lookup failed"
@@ -106,38 +149,6 @@ def find_mx(domain: str, timeout: float = 10.0) -> tuple[str | None, str]:
         return None, "domain has no mail server"
 
 
-def probe(
-    mx_host: str,
-    email: str,
-    domain: str,
-    from_address: str,
-    timeout: float = 10.0,
-) -> tuple[int, bool | None]:
-    """Ask the mail server about an address without sending anything.
-
-    Returns the reply code for the address, plus whether the domain accepts
-    every address it is offered. That second answer is the important one: a
-    domain that accepts everything cannot confirm any single mailbox.
-    """
-    with smtplib.SMTP(timeout=timeout) as smtp:
-        smtp.connect(mx_host, 25)
-        smtp.ehlo_or_helo_if_needed()
-        smtp.mail(from_address)
-
-        code, _ = smtp.rcpt(email)
-
-        try:
-            decoy = f"{secrets.token_hex(12)}@{domain}"
-            decoy_code, _ = smtp.rcpt(decoy)
-            catch_all = decoy_code in ACCEPTED
-        except (smtplib.SMTPException, OSError):
-            # Some servers hang up after the first recipient. Without the
-            # second answer we cannot rule out a catch-all.
-            catch_all = None
-
-    return code, catch_all
-
-
 def decide(code: int, catch_all: bool | None, disposable: bool) -> tuple[str, str]:
     """Turn a server reply into a status and a plain explanation.
 
@@ -147,7 +158,7 @@ def decide(code: int, catch_all: bool | None, disposable: bool) -> tuple[str, st
         if catch_all is True:
             return RISKY, "server accepts every address on this domain, so this mailbox cannot be confirmed"
         if catch_all is None:
-            return UNKNOWN, "server accepted the address but closed before the catch-all check"
+            return UNKNOWN, "server accepted the address but we could not check for a catch-all"
         if disposable:
             return RISKY, "mailbox exists but the domain is a throwaway mail service"
         return VALID, "server confirmed the mailbox exists"
@@ -166,61 +177,131 @@ def decide(code: int, catch_all: bool | None, disposable: bool) -> tuple[str, st
     return UNKNOWN, f"unexpected reply from server (code {code})"
 
 
-def verify(
-    email: str,
-    from_address: str = "verify@example.com",
-    timeout: float = 10.0,
-) -> Result:
-    """Check one address end to end."""
-    email = email.strip()
-
-    if len(email) > MAX_TOTAL or not _SYNTAX.match(email):
-        return Result(email, INVALID, "not a valid email address format")
-
+def _flags(email: str) -> tuple[bool, bool]:
     local, _, domain = email.rpartition("@")
-    domain = domain.lower()
+    return domain.lower() in DISPOSABLE_DOMAINS, local.lower() in ROLE_NAMES
 
-    if len(local) > MAX_LOCAL:
-        return Result(email, INVALID, "the part before the @ is too long")
 
-    disposable = domain in DISPOSABLE_DOMAINS
-    role = local.lower() in ROLE_NAMES
+def _explain_failure(exc: BaseException) -> str:
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "mail server did not respond in time"
+    if isinstance(exc, smtplib.SMTPServerDisconnected):
+        return "mail server closed the connection"
+    if isinstance(exc, ConnectionRefusedError):
+        return "mail server refused the connection"
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) is not None:
+        return (
+            "could not reach the mail server, outbound port 25 is blocked on "
+            "most hosting providers"
+        )
+    return f"could not complete the check ({type(exc).__name__})"
+
+
+def verify_domain(
+    domain: str,
+    emails: list[str],
+    from_address: str = DEFAULT_FROM,
+    timeout: float = 10.0,
+) -> dict[str, Result]:
+    """Check every address at one domain over a single connection.
+
+    One connection per domain rather than one per address. Opening many
+    connections to the same server in parallel is what gets a sender blocked,
+    and reusing one is faster besides.
+    """
+    results: dict[str, Result] = {}
 
     mx_host, note = find_mx(domain, timeout=timeout)
     if mx_host is None:
-        return Result(email, INVALID, note, disposable=disposable, role=role)
+        for email in emails:
+            disposable, role = _flags(email)
+            results[email] = Result(email, INVALID, note, disposable=disposable, role=role)
+        return results
 
+    failure = "could not complete the check"
     try:
-        code, catch_all = probe(mx_host, email, domain, from_address, timeout)
-    except (socket.timeout, TimeoutError):
-        return Result(
-            email, UNKNOWN, "mail server did not respond in time",
-            mx=mx_host, disposable=disposable, role=role,
-        )
-    except (smtplib.SMTPException, OSError) as exc:
-        return Result(
-            email, UNKNOWN,
-            f"could not reach the mail server ({type(exc).__name__}), "
-            "outbound port 25 may be blocked on this network",
-            mx=mx_host, disposable=disposable, role=role,
-        )
+        with smtplib.SMTP(local_hostname=helo_name(from_address), timeout=timeout) as smtp:
+            smtp.connect(mx_host, 25)
+            smtp.ehlo_or_helo_if_needed()
+            smtp.mail(from_address)
 
-    status, reason = decide(code, catch_all, disposable)
-    return Result(email, status, reason, mx_host, catch_all, disposable, role)
+            # Ask about an address that cannot exist, before asking about any
+            # real one. If the server accepts this, its answers carry no
+            # information and there is no point probing the rest.
+            decoy_code, _ = smtp.rcpt(f"{secrets.token_hex(12)}@{domain}")
+            catch_all = decoy_code in ACCEPTED
+
+            for email in emails:
+                disposable, role = _flags(email)
+                if catch_all:
+                    status, reason = decide(250, True, disposable)
+                    code = 250
+                else:
+                    code, _ = smtp.rcpt(email)
+                    status, reason = decide(code, False, disposable)
+                results[email] = Result(
+                    email, status, reason, mx_host, catch_all, disposable, role
+                )
+    except (smtplib.SMTPException, OSError) as exc:
+        failure = _explain_failure(exc)
+
+    # Anything the connection did not get to is reported honestly rather than
+    # guessed at.
+    for email in emails:
+        if email not in results:
+            disposable, role = _flags(email)
+            results[email] = Result(
+                email, UNKNOWN, failure, mx=mx_host, disposable=disposable, role=role
+            )
+    return results
 
 
 def verify_many(
     emails: list[str],
-    from_address: str = "verify@example.com",
+    from_address: str = DEFAULT_FROM,
     timeout: float = 10.0,
     workers: int = 5,
 ) -> list[Result]:
-    """Check several addresses at once, keeping the input order."""
-    if not emails:
-        return []
+    """Check several addresses, grouped by domain, keeping the input order."""
+    cleaned = [e.strip() for e in emails]
+    results: dict[str, Result] = {}
+    groups: dict[str, list[str]] = {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        return list(pool.map(lambda e: verify(e, from_address, timeout), emails))
+    for email in cleaned:
+        problem = format_error(email)
+        if problem:
+            results[email] = Result(email, INVALID, problem)
+        else:
+            groups.setdefault(email.rpartition("@")[2].lower(), []).append(email)
+
+    if groups:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(verify_domain, domain, members, from_address, timeout): members
+                for domain, members in groups.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                members = futures[future]
+                try:
+                    results.update(future.result())
+                except Exception as exc:  # one bad domain must not sink the batch
+                    for email in members:
+                        disposable, role = _flags(email)
+                        results[email] = Result(
+                            email, UNKNOWN, _explain_failure(exc),
+                            disposable=disposable, role=role,
+                        )
+
+    return [results[email] for email in cleaned]
+
+
+def verify(
+    email: str,
+    from_address: str = DEFAULT_FROM,
+    timeout: float = 10.0,
+) -> Result:
+    """Check one address end to end."""
+    return verify_many([email], from_address, timeout, workers=1)[0]
 
 
 # The browser page is kept here so the tool stays a single file with no
@@ -254,7 +335,7 @@ PAGE = """<!doctype html>
     font:14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   textarea:focus { outline:2px solid var(--ink); outline-offset:-1px; }
-  .row { display:flex; gap:12px; align-items:center; margin-top:14px; }
+  .row { display:flex; gap:12px; align-items:center; margin-top:14px; flex-wrap:wrap; }
   button {
     background:var(--ink); color:var(--bg); border:0; border-radius:9px;
     padding:11px 22px; font-size:15px; font-weight:600; cursor:pointer;
@@ -271,7 +352,6 @@ PAGE = """<!doctype html>
   .badge { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap; }
   .valid{color:var(--valid)} .invalid{color:var(--invalid)}
   .risky{color:var(--risky)} .unknown{color:var(--unknown)}
-  .why { color:var(--soft); font-size:13.5px; }
   .flag {
     display:inline-block; margin-left:6px; padding:1px 7px; border:1px solid var(--line);
     border-radius:20px; font-size:11px; color:var(--soft); text-transform:uppercase; letter-spacing:.04em;
@@ -346,11 +426,85 @@ or one address per line"></textarea>
 # Checking a large list from one IP address gets that address refused by mail
 # servers. The browser makes it easy to paste thousands by accident.
 MAX_PER_REQUEST = 100
+MAX_BODY_BYTES = 100_000
+
+
+def make_handler(from_address: str, timeout: float, workers: int):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = f"mailprobe/{__version__}"
+
+        def _send(self, code, body, content_type):
+            payload = body.encode("utf-8")
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the tab was closed while we were still checking
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj), "application/json")
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, PAGE, "text/html; charset=utf-8")
+            elif self.path == "/favicon.ico":
+                try:
+                    self.send_response(204)
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self._send(404, "not found", "text/plain; charset=utf-8")
+
+        def do_POST(self):
+            if self.path != "/check":
+                self._send(404, "not found", "text/plain; charset=utf-8")
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._json(400, {"error": "could not read that input"})
+                return
+
+            if length > MAX_BODY_BYTES:
+                self._json(413, {"error": "that is too much text to check at once"})
+                return
+
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                emails = _split(str(payload.get("emails", "")).splitlines())
+            except (ValueError, TypeError):
+                self._json(400, {"error": "could not read that input"})
+                return
+
+            if not emails:
+                self._json(200, {"results": []})
+                return
+
+            if len(emails) > MAX_PER_REQUEST:
+                self._json(200, {
+                    "error": f"{len(emails)} addresses is too many at once. "
+                             f"Check up to {MAX_PER_REQUEST} here, or use the "
+                             f"command line for larger lists."
+                })
+                return
+
+            results = verify_many(emails, from_address, timeout, workers)
+            self._json(200, {"results": [asdict(r) for r in results]})
+
+        def log_message(self, *args):
+            pass  # keep the terminal readable
+
+    return Handler
 
 
 def serve(
     port: int = 8765,
-    from_address: str = "verify@example.com",
+    from_address: str = DEFAULT_FROM,
     timeout: float = 10.0,
     workers: int = 5,
     open_browser: bool = True,
@@ -360,61 +514,15 @@ def serve(
     Bound to localhost on purpose. This tool opens connections to other
     people's mail servers, so it should not be reachable from the network.
     """
+    handler = make_handler(from_address, timeout, workers)
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, code, body, content_type):
-            payload = body.encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError as exc:
+        print(f"could not start on port {port}: {exc}", file=sys.stderr)
+        print("try a different one with --port", file=sys.stderr)
+        raise SystemExit(1)
 
-        def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                self._send(200, PAGE, "text/html; charset=utf-8")
-            elif self.path == "/favicon.ico":
-                self.send_response(204)
-                self.end_headers()
-            else:
-                self._send(404, "not found", "text/plain; charset=utf-8")
-
-        def do_POST(self):
-            if self.path != "/check":
-                self._send(404, "not found", "text/plain; charset=utf-8")
-                return
-
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > 100_000:
-                self._send(413, json.dumps({"error": "that is too much text to check at once"}),
-                           "application/json")
-                return
-
-            try:
-                payload = json.loads(self.rfile.read(length) or b"{}")
-                emails = _split(str(payload.get("emails", "")).splitlines())
-            except (ValueError, TypeError):
-                self._send(400, json.dumps({"error": "could not read that input"}), "application/json")
-                return
-
-            if not emails:
-                self._send(200, json.dumps({"results": []}), "application/json")
-                return
-
-            if len(emails) > MAX_PER_REQUEST:
-                self._send(200, json.dumps({
-                    "error": f"{len(emails)} addresses is too many at once. "
-                             f"Check up to {MAX_PER_REQUEST} here, or use the command line for larger lists."
-                }), "application/json")
-                return
-
-            results = verify_many(emails, from_address, timeout, workers)
-            self._send(200, json.dumps({"results": [asdict(r) for r in results]}), "application/json")
-
-        def log_message(self, *args):
-            pass  # keep the terminal readable
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
     print(f"mailprobe is running at {url}")
     print("press ctrl+c to stop")
@@ -446,25 +554,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print results as JSON")
     parser.add_argument(
         "--from-address",
-        default="verify@example.com",
-        help="address to introduce ourselves with, use a domain you own",
+        default=None,
+        help=f"address to introduce ourselves with, use a domain you own "
+             f"(or set {FROM_ENV_VAR})",
     )
     parser.add_argument("--timeout", type=float, default=10.0, help="seconds to wait per step")
-    parser.add_argument("--workers", type=int, default=5, help="how many addresses to check at once")
+    parser.add_argument("--workers", type=int, default=5, help="how many domains to check at once")
     parser.add_argument("--serve", action="store_true", help="open the browser interface on this machine")
     parser.add_argument("--port", type=int, default=8765, help="port for --serve")
     parser.add_argument("--no-browser", action="store_true", help="with --serve, do not open a browser window")
+    parser.add_argument("--quiet", action="store_true", help="do not print the sender warning")
+    parser.add_argument("--version", action="version", version=f"mailprobe {__version__}")
     args = parser.parse_args(argv)
 
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than zero")
+
+    from_address = args.from_address or default_from_address()
+    if format_error(from_address):
+        parser.error(f"--from-address is not a valid email address: {from_address}")
+
+    if from_address == DEFAULT_FROM and not args.quiet:
+        print(
+            f"note: introducing ourselves as {DEFAULT_FROM}, which some mail servers refuse.\n"
+            f"      set {FROM_ENV_VAR} or pass --from-address with a domain you own "
+            f"for better results.",
+            file=sys.stderr,
+        )
+
     if args.serve:
-        serve(args.port, args.from_address, args.timeout, args.workers, not args.no_browser)
+        serve(args.port, from_address, args.timeout, args.workers, not args.no_browser)
         return 0
 
     emails = _split(args.emails) if args.emails else _split(sys.stdin.read().splitlines())
     if not emails:
         parser.error("no addresses given")
 
-    results = verify_many(emails, args.from_address, args.timeout, args.workers)
+    results = verify_many(emails, from_address, args.timeout, args.workers)
 
     if args.json:
         print(json.dumps([asdict(r) for r in results], indent=2))

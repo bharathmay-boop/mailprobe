@@ -1,5 +1,7 @@
 # mailprobe
 
+[![tests](https://github.com/bharathmay-boop/mailprobe/actions/workflows/test.yml/badge.svg)](https://github.com/bharathmay-boop/mailprobe/actions/workflows/test.yml)
+
 Check whether an email address can actually receive mail, and say "unknown" when that cannot be determined.
 
 ## The problem
@@ -52,7 +54,25 @@ cd mailprobe
 pip install .
 ```
 
-Python 3.9 or newer. The only dependency is dnspython, used for the mail server lookup.
+Python 3.9 or newer. The only dependency is dnspython, used for the mail server lookup. The tests run against 3.9, 3.11, and 3.13.
+
+## Set your sending address first
+
+Before checking anything, tell mailprobe who to say it is. Mail servers ask, and the answer changes how they treat you.
+
+```bash
+export MAILPROBE_FROM="checks@yourdomain.com"
+```
+
+Put that in your shell profile so it sticks. On Windows PowerShell:
+
+```powershell
+setx MAILPROBE_FROM "checks@yourdomain.com"
+```
+
+Use a domain you actually own. Nothing is sent from it and no mailbox needs to exist behind it, but the domain itself should be real, because the receiving server may check that it resolves. You can also pass `--from-address` on any single run, which overrides the variable.
+
+If you skip this, mailprobe falls back to `verify@example.com` and prints a reminder. That fallback works against some servers and is refused by others, so results will be worse and less consistent. The reminder can be silenced with `--quiet` once you understand the tradeoff.
 
 ## Use
 
@@ -98,13 +118,23 @@ The interface is deliberately bound to localhost, so it is reachable from your m
 
 | Option | Default | What it does |
 |---|---|---|
-| `--from-address` | `verify@example.com` | The address used to introduce ourselves to the mail server. Set this to a domain you own. |
-| `--timeout` | `10` | Seconds to wait for each step. |
-| `--workers` | `5` | How many addresses to check at the same time. |
-| `--json` | off | Print results as JSON. |
+| `--from-address` | `MAILPROBE_FROM`, else `verify@example.com` | The address used to introduce ourselves to the mail server. Set this to a domain you own. |
+| `--timeout` | `10` | Seconds to wait for each step. The DNS lookup and the mail server conversation are separate steps, so a single address can take up to twice this. |
+| `--workers` | `5` | How many domains to check at the same time. |
+| `--json` | off | Print results as JSON, on standard output. Warnings go to standard error, so piping to a JSON reader stays clean. |
 | `--serve` | off | Open the browser interface on this machine. |
 | `--port` | `8765` | Port for `--serve`. |
 | `--no-browser` | off | With `--serve`, do not open a browser window. |
+| `--quiet` | off | Do not print the reminder about the sending address. |
+| `--version` | | Print the version and exit. |
+
+The command exits with status 1 if any address came back invalid, and 0 otherwise, which is useful in scripts.
+
+## How it handles a list
+
+Addresses are grouped by domain before anything happens. Each domain gets one connection, and the addresses on it are checked one after another over that connection. Domains are handled in parallel, up to `--workers`.
+
+This matters for two reasons. Opening a separate connection for every address on the same domain is the fastest way to get your IP address refused. And when a domain turns out to be catch-all, mailprobe finds that out once and marks every address on it as risky without probing them individually.
 
 ## Things worth knowing before you rely on this
 
@@ -112,9 +142,11 @@ The interface is deliberately bound to localhost, so it is reachable from your m
 
 That is why there is no public demo link to click, and why the browser interface runs locally instead of being deployed. This is how mail works, not something the code can route around. If you do want it on a server, you need a host that will lift the port 25 block for you, which usually means asking support and explaining what you are doing.
 
-**Set `--from-address` to a domain you control.** Mail servers check who is asking. Leaving the default in place will get you turned away more often.
+**Set `MAILPROBE_FROM` to a domain you control.** Mail servers check who is asking, and mailprobe also uses that domain when it greets them. Leaving the default in place will get you turned away more often. See the section above.
 
-**Go gently on volume.** Checking thousands of addresses from one IP address in a short window looks like the behaviour of a spammer, and mail servers will start refusing you. Lower `--workers` for large lists.
+**Go gently on volume.** Checking thousands of addresses from one IP address in a short window looks like the behaviour of a spammer, and mail servers will start refusing you. Lower `--workers` for large lists. The browser interface caps a single batch at 100 for this reason. The command line does not cap you, on the assumption that if you are scripting it you know what you are doing.
+
+**Addresses with non-English characters are rejected.** Internationalised addresses and domains are treated as bad format rather than being converted. If you need them, that conversion is the piece to add.
 
 **Large providers vary.** Gmail answers honestly about whether a mailbox exists. Some other large providers accept everything at this stage and reject later, which means an honest result for them is `risky`, not `valid`. That is the correct answer, not a gap.
 
@@ -126,7 +158,9 @@ That is why there is no public demo link to click, and why the browser interface
 python test_mailprobe.py
 ```
 
-The tests cover format rules and how server replies map to a status, and do not touch the network.
+The tests cover address format rules, how server replies map to a status, the greeting name, and the local web interface. None of them send traffic to a mail server, so they pass anywhere, including on build machines where port 25 is blocked.
+
+They run on plain asserts with no test framework, so there is nothing extra to install.
 
 ## Licence
 

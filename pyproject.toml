@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mailprobe"
-version = "0.1.0"
+version = "0.2.0"
 description = "Check whether an email address can actually receive mail, and say so honestly when it cannot be determined."
 readme = "README.md"
 requires-python = ">=3.9"
