@@ -42,6 +42,8 @@ The `unknown` status is deliberate. A server that refuses to answer has told you
 
 Two extra flags are reported alongside the status. `role` marks addresses like support@ or info@ that usually reach a team rather than one person. `disposable` marks throwaway mail services. Neither is a failure on its own, so they are reported separately and you decide what they mean for your use.
 
+![The browser interface, showing all four result types](docs/screenshot.png)
+
 ## Install
 
 ```bash
@@ -82,6 +84,16 @@ result = verify("someone@example.com")
 print(result.status, result.reason)
 ```
 
+### In a browser
+
+```bash
+mailprobe --serve
+```
+
+This starts a small interface on your own machine and opens it, as shown in the picture above. Paste in a list, press Check, and the results appear in a table. Use `--port` to pick a different port, and `--no-browser` to stop it opening a window.
+
+The interface is deliberately bound to localhost, so it is reachable from your machine only and not from the rest of your network. It is built into the tool and needs nothing beyond what the install already gave you.
+
 ### Options
 
 | Option | Default | What it does |
@@ -90,10 +102,15 @@ print(result.status, result.reason)
 | `--timeout` | `10` | Seconds to wait for each step. |
 | `--workers` | `5` | How many addresses to check at the same time. |
 | `--json` | off | Print results as JSON. |
+| `--serve` | off | Open the browser interface on this machine. |
+| `--port` | `8765` | Port for `--serve`. |
+| `--no-browser` | off | With `--serve`, do not open a browser window. |
 
 ## Things worth knowing before you rely on this
 
-**Outbound port 25 is blocked on most hosted platforms.** This is the big one. Checking a mailbox requires talking to the receiving mail server on port 25, and AWS, Google Cloud, Azure, Vercel, and most shared hosting block that by default to limit spam. On those platforms every check returns `unknown`. mailprobe is built to run from a machine where port 25 is open, such as a local computer or a server where the block has been lifted. This is a limit of how mail works, not something the code can route around.
+**This runs on your machine, not on a server somewhere.** Checking a mailbox means opening a connection to the receiving mail server on port 25. Home and office internet connections normally allow that, so the tool works as soon as you install it. Hosting providers are the problem: AWS, Google Cloud, Azure, Vercel, and most shared hosting block outbound port 25 by default to limit spam, and on those every check comes back `unknown`.
+
+That is why there is no public demo link to click, and why the browser interface runs locally instead of being deployed. This is how mail works, not something the code can route around. If you do want it on a server, you need a host that will lift the port 25 block for you, which usually means asking support and explaining what you are doing.
 
 **Set `--from-address` to a domain you control.** Mail servers check who is asking. Leaving the default in place will get you turned away more often.
 

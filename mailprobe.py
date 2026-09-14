@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.server
 import json
 import re
 import secrets
 import smtplib
 import socket
 import sys
+import threading
+import webbrowser
 from dataclasses import asdict, dataclass
 
 import dns.resolver
@@ -220,6 +223,213 @@ def verify_many(
         return list(pool.map(lambda e: verify(e, from_address, timeout), emails))
 
 
+# The browser page is kept here so the tool stays a single file with no
+# data files to install alongside it.
+PAGE = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mailprobe</title>
+<style>
+  :root {
+    --bg:#f7f6f3; --card:#fff; --ink:#1b1d22; --soft:#6b6f77; --line:#e2e0da;
+    --valid:#2f7a4d; --invalid:#b03a2e; --risky:#a6701c; --unknown:#6b6f77;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#15171b; --card:#1d2026; --ink:#e9e7e1; --soft:#9aa0aa; --line:#2c3037;
+      --valid:#68b98a; --invalid:#e07a6b; --risky:#d7a45a; --unknown:#9aa0aa;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:40px 20px 80px; background:var(--bg); color:var(--ink);
+    font:15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width:760px; margin:0 auto; }
+  h1 { font-size:26px; margin:0 0 6px; letter-spacing:-.02em; }
+  .sub { color:var(--soft); margin:0 0 28px; }
+  textarea {
+    width:100%; min-height:150px; padding:14px 16px; border:1px solid var(--line);
+    border-radius:10px; background:var(--card); color:var(--ink); resize:vertical;
+    font:14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  textarea:focus { outline:2px solid var(--ink); outline-offset:-1px; }
+  .row { display:flex; gap:12px; align-items:center; margin-top:14px; }
+  button {
+    background:var(--ink); color:var(--bg); border:0; border-radius:9px;
+    padding:11px 22px; font-size:15px; font-weight:600; cursor:pointer;
+  }
+  button:disabled { opacity:.55; cursor:default; }
+  .note { color:var(--soft); font-size:13.5px; }
+  table { width:100%; border-collapse:collapse; margin-top:30px; }
+  th {
+    text-align:left; font-size:11.5px; text-transform:uppercase; letter-spacing:.07em;
+    color:var(--soft); font-weight:600; padding:0 10px 8px 0; border-bottom:1px solid var(--line);
+  }
+  td { padding:13px 10px 13px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  td.addr { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13.5px; overflow-wrap:anywhere; }
+  .badge { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; white-space:nowrap; }
+  .valid{color:var(--valid)} .invalid{color:var(--invalid)}
+  .risky{color:var(--risky)} .unknown{color:var(--unknown)}
+  .why { color:var(--soft); font-size:13.5px; }
+  .flag {
+    display:inline-block; margin-left:6px; padding:1px 7px; border:1px solid var(--line);
+    border-radius:20px; font-size:11px; color:var(--soft); text-transform:uppercase; letter-spacing:.04em;
+  }
+</style>
+<div class="wrap">
+  <h1>mailprobe</h1>
+  <p class="sub">Checks whether an address can actually receive mail. Says unknown when the server will not tell us.</p>
+
+  <textarea id="input" placeholder="one@example.com, two@example.com
+or one address per line"></textarea>
+
+  <div class="row">
+    <button id="go">Check</button>
+    <span class="note" id="note">Runs on your machine. Nothing is sent to any third party.</span>
+  </div>
+
+  <div id="out"></div>
+</div>
+<script>
+  const input = document.getElementById('input');
+  const go = document.getElementById('go');
+  const note = document.getElementById('note');
+  const out = document.getElementById('out');
+
+  async function check() {
+    const text = input.value.trim();
+    if (!text) { input.focus(); return; }
+
+    go.disabled = true;
+    note.textContent = 'Checking. Each address needs a round trip to its mail server.';
+    out.innerHTML = '';
+
+    try {
+      const res = await fetch('/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emails: text })
+      });
+      const data = await res.json();
+      if (data.error) { note.textContent = data.error; return; }
+      render(data.results);
+      note.textContent = data.results.length + ' checked.';
+    } catch (e) {
+      note.textContent = 'Could not reach the local server. Is it still running?';
+    } finally {
+      go.disabled = false;
+    }
+  }
+
+  function render(rows) {
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    let html = '<table><tr><th>Address</th><th>Result</th><th>Why</th></tr>';
+    for (const r of rows) {
+      let flags = '';
+      if (r.disposable) flags += '<span class="flag">disposable</span>';
+      if (r.role) flags += '<span class="flag">role</span>';
+      html += '<tr><td class="addr">' + esc(r.email) + '</td>'
+            + '<td><span class="badge ' + esc(r.status) + '">' + esc(r.status) + '</span></td>'
+            + '<td class="why">' + esc(r.reason) + flags + '</td></tr>';
+    }
+    out.innerHTML = html + '</table>';
+  }
+
+  go.addEventListener('click', check);
+  input.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') check();
+  });
+</script>
+"""
+
+# Checking a large list from one IP address gets that address refused by mail
+# servers. The browser makes it easy to paste thousands by accident.
+MAX_PER_REQUEST = 100
+
+
+def serve(
+    port: int = 8765,
+    from_address: str = "verify@example.com",
+    timeout: float = 10.0,
+    workers: int = 5,
+    open_browser: bool = True,
+) -> None:
+    """Run the browser interface on this machine.
+
+    Bound to localhost on purpose. This tool opens connections to other
+    people's mail servers, so it should not be reachable from the network.
+    """
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body, content_type):
+            payload = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, PAGE, "text/html; charset=utf-8")
+            elif self.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self._send(404, "not found", "text/plain; charset=utf-8")
+
+        def do_POST(self):
+            if self.path != "/check":
+                self._send(404, "not found", "text/plain; charset=utf-8")
+                return
+
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 100_000:
+                self._send(413, json.dumps({"error": "that is too much text to check at once"}),
+                           "application/json")
+                return
+
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                emails = _split(str(payload.get("emails", "")).splitlines())
+            except (ValueError, TypeError):
+                self._send(400, json.dumps({"error": "could not read that input"}), "application/json")
+                return
+
+            if not emails:
+                self._send(200, json.dumps({"results": []}), "application/json")
+                return
+
+            if len(emails) > MAX_PER_REQUEST:
+                self._send(200, json.dumps({
+                    "error": f"{len(emails)} addresses is too many at once. "
+                             f"Check up to {MAX_PER_REQUEST} here, or use the command line for larger lists."
+                }), "application/json")
+                return
+
+            results = verify_many(emails, from_address, timeout, workers)
+            self._send(200, json.dumps({"results": [asdict(r) for r in results]}), "application/json")
+
+        def log_message(self, *args):
+            pass  # keep the terminal readable
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}"
+    print(f"mailprobe is running at {url}")
+    print("press ctrl+c to stop")
+
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        server.server_close()
+
+
 def _split(values: list[str]) -> list[str]:
     out = []
     for value in values:
@@ -241,7 +451,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=10.0, help="seconds to wait per step")
     parser.add_argument("--workers", type=int, default=5, help="how many addresses to check at once")
+    parser.add_argument("--serve", action="store_true", help="open the browser interface on this machine")
+    parser.add_argument("--port", type=int, default=8765, help="port for --serve")
+    parser.add_argument("--no-browser", action="store_true", help="with --serve, do not open a browser window")
     args = parser.parse_args(argv)
+
+    if args.serve:
+        serve(args.port, args.from_address, args.timeout, args.workers, not args.no_browser)
+        return 0
 
     emails = _split(args.emails) if args.emails else _split(sys.stdin.read().splitlines())
     if not emails:
