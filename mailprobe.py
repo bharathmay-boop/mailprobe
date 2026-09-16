@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass
 import dns.exception
 import dns.resolver
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 VALID = "valid"
 INVALID = "invalid"
@@ -48,6 +48,18 @@ _SYNTAX = re.compile(
 
 # A 2xx reply to RCPT TO means the server accepted the recipient.
 ACCEPTED = frozenset({250, 251})
+
+# Servers put a second, more precise code at the front of their reply text,
+# such as "5.7.1" in "550 5.7.1 Client host blocked". RFC 3463 defines what
+# the middle number means, and it is the difference between "this mailbox does
+# not exist" and "we do not like you". Without reading it, a server refusing
+# our IP address looks identical to a missing mailbox.
+_ENHANCED = re.compile(r"^\s*([245])\.(\d{1,3})\.(\d{1,3})\b")
+
+# Rejections that are about the sender or the route, never about the mailbox.
+#   7 = the server's policy, including blocklists and reputation
+#   4 = the network or routing between us
+NOT_ABOUT_THE_MAILBOX = frozenset({"7", "4"})
 
 # Mailboxes that usually belong to a team rather than a person. Still real
 # addresses, so this is reported as a flag and does not change the status.
@@ -82,6 +94,25 @@ class Result:
     catch_all: bool | None = None
     disposable: bool = False
     role: bool = False
+    detail: str | None = None  # what the mail server actually said
+
+
+def rejected_the_sender(message: str) -> bool:
+    """Was this refusal about us rather than about the address we asked for?
+
+    A server that has our IP address on a blocklist answers with the same 550
+    it uses for a missing mailbox. Treating the two the same is how a list
+    cleaner deletes working addresses. Home broadband is on those blocklists
+    as a matter of course, so this is the normal case, not an edge case.
+    """
+    found = _ENHANCED.match(message or "")
+    return bool(found) and found.group(2) in NOT_ABOUT_THE_MAILBOX
+
+
+def first_line(message: str) -> str:
+    """The server's own words, trimmed to something readable."""
+    line = (message or "").strip().splitlines()[0] if (message or "").strip() else ""
+    return line[:200]
 
 
 def default_from_address() -> str:
@@ -149,11 +180,23 @@ def find_mx(domain: str, timeout: float = 10.0) -> tuple[str | None, str]:
         return None, "domain has no mail server"
 
 
-def decide(code: int, catch_all: bool | None, disposable: bool) -> tuple[str, str]:
+def decide(
+    code: int,
+    catch_all: bool | None,
+    disposable: bool,
+    message: str = "",
+) -> tuple[str, str]:
     """Turn a server reply into a status and a plain explanation.
 
     Kept free of network calls so the rules can be tested directly.
     """
+    if 500 <= code < 600 and rejected_the_sender(message):
+        return UNKNOWN, (
+            "the server refused us, not the address, so the mailbox was never "
+            "checked. This usually means the IP address you are checking from "
+            "is on a blocklist"
+        )
+
     if code in ACCEPTED:
         if catch_all is True:
             return RISKY, "server accepts every address on this domain, so this mailbox cannot be confirmed"
@@ -177,24 +220,42 @@ def decide(code: int, catch_all: bool | None, disposable: bool) -> tuple[str, st
     return UNKNOWN, f"unexpected reply from server (code {code})"
 
 
+def _text(raw) -> str:
+    """Mail servers answer in bytes. Read them without choking on odd encodings."""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw or "")
+
+
 def _flags(email: str) -> tuple[bool, bool]:
     local, _, domain = email.rpartition("@")
     return domain.lower() in DISPOSABLE_DOMAINS, local.lower() in ROLE_NAMES
 
 
-def _explain_failure(exc: BaseException) -> str:
+def _explain_failure(exc: BaseException) -> tuple[str, str | None]:
+    """A plain reason for a failed check, plus the server's own words."""
+    if isinstance(exc, smtplib.SMTPResponseException):
+        said = _text(getattr(exc, "smtp_error", b""))
+        if rejected_the_sender(said):
+            return (
+                "the server refused us before it would discuss any address. "
+                "This usually means the IP address you are checking from is "
+                "on a blocklist"
+            ), first_line(said)
+        return f"server refused the check (code {exc.smtp_code})", first_line(said)
+
     if isinstance(exc, (socket.timeout, TimeoutError)):
-        return "mail server did not respond in time"
+        return "mail server did not respond in time", None
     if isinstance(exc, smtplib.SMTPServerDisconnected):
-        return "mail server closed the connection"
+        return "mail server closed the connection", None
     if isinstance(exc, ConnectionRefusedError):
-        return "mail server refused the connection"
+        return "mail server refused the connection", None
     if isinstance(exc, OSError) and getattr(exc, "errno", None) is not None:
         return (
             "could not reach the mail server, outbound port 25 is blocked on "
             "most hosting providers"
-        )
-    return f"could not complete the check ({type(exc).__name__})"
+        ), None
+    return f"could not complete the check ({type(exc).__name__})", None
 
 
 def verify_domain(
@@ -218,7 +279,7 @@ def verify_domain(
             results[email] = Result(email, INVALID, note, disposable=disposable, role=role)
         return results
 
-    failure = "could not complete the check"
+    failure, failure_detail = "could not complete the check", None
     try:
         with smtplib.SMTP(local_hostname=helo_name(from_address), timeout=timeout) as smtp:
             smtp.connect(mx_host, 25)
@@ -228,22 +289,39 @@ def verify_domain(
             # Ask about an address that cannot exist, before asking about any
             # real one. If the server accepts this, its answers carry no
             # information and there is no point probing the rest.
-            decoy_code, _ = smtp.rcpt(f"{secrets.token_hex(12)}@{domain}")
+            decoy_code, decoy_msg = smtp.rcpt(f"{secrets.token_hex(12)}@{domain}")
+            decoy_text = _text(decoy_msg)
+
+            # If the server refuses us outright, nothing it says about any
+            # address means anything. Stop rather than collect wrong answers.
+            if 500 <= decoy_code < 600 and rejected_the_sender(decoy_text):
+                status, reason = decide(decoy_code, None, False, decoy_text)
+                for email in emails:
+                    disposable, role = _flags(email)
+                    results[email] = Result(
+                        email, status, reason, mx_host,
+                        disposable=disposable, role=role,
+                        detail=first_line(decoy_text),
+                    )
+                return results
+
             catch_all = decoy_code in ACCEPTED
 
             for email in emails:
                 disposable, role = _flags(email)
                 if catch_all:
+                    code, text = 250, decoy_text
                     status, reason = decide(250, True, disposable)
-                    code = 250
                 else:
-                    code, _ = smtp.rcpt(email)
-                    status, reason = decide(code, False, disposable)
+                    code, raw = smtp.rcpt(email)
+                    text = _text(raw)
+                    status, reason = decide(code, False, disposable, text)
                 results[email] = Result(
-                    email, status, reason, mx_host, catch_all, disposable, role
+                    email, status, reason, mx_host, catch_all, disposable, role,
+                    detail=first_line(text),
                 )
     except (smtplib.SMTPException, OSError) as exc:
-        failure = _explain_failure(exc)
+        failure, failure_detail = _explain_failure(exc)
 
     # Anything the connection did not get to is reported honestly rather than
     # guessed at.
@@ -251,7 +329,8 @@ def verify_domain(
         if email not in results:
             disposable, role = _flags(email)
             results[email] = Result(
-                email, UNKNOWN, failure, mx=mx_host, disposable=disposable, role=role
+                email, UNKNOWN, failure, mx=mx_host,
+                disposable=disposable, role=role, detail=failure_detail,
             )
     return results
 
@@ -285,11 +364,12 @@ def verify_many(
                 try:
                     results.update(future.result())
                 except Exception as exc:  # one bad domain must not sink the batch
+                    reason, detail = _explain_failure(exc)
                     for email in members:
                         disposable, role = _flags(email)
                         results[email] = Result(
-                            email, UNKNOWN, _explain_failure(exc),
-                            disposable=disposable, role=role,
+                            email, UNKNOWN, reason,
+                            disposable=disposable, role=role, detail=detail,
                         )
 
     return [results[email] for email in cleaned]
@@ -356,6 +436,10 @@ PAGE = """<!doctype html>
     display:inline-block; margin-left:6px; padding:1px 7px; border:1px solid var(--line);
     border-radius:20px; font-size:11px; color:var(--soft); text-transform:uppercase; letter-spacing:.04em;
   }
+  .said {
+    margin-top:6px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size:12px; color:var(--soft); overflow-wrap:anywhere;
+  }
 </style>
 <div class="wrap">
   <h1>mailprobe</h1>
@@ -409,9 +493,10 @@ or one address per line"></textarea>
       let flags = '';
       if (r.disposable) flags += '<span class="flag">disposable</span>';
       if (r.role) flags += '<span class="flag">role</span>';
+      const said = r.detail ? '<div class="said">' + esc(r.detail) + '</div>' : '';
       html += '<tr><td class="addr">' + esc(r.email) + '</td>'
             + '<td><span class="badge ' + esc(r.status) + '">' + esc(r.status) + '</span></td>'
-            + '<td class="why">' + esc(r.reason) + flags + '</td></tr>';
+            + '<td class="why">' + esc(r.reason) + flags + said + '</td></tr>';
     }
     out.innerHTML = html + '</table>';
   }

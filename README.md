@@ -40,6 +40,8 @@ mailprobe runs four checks in order and stops as soon as it has a definite answe
 | `risky` | The address may work, but it cannot be confirmed. Catch-all domains and throwaway mail services land here. |
 | `unknown` | The server would not answer. It asked us to retry later, hung up, or could not be reached. |
 
+Every result also carries `detail`, which is the mail server's own reply, so you can check the tool's reading against what was actually said.
+
 The `unknown` status is deliberate. A server that refuses to answer has told you nothing, and recording that as either valid or invalid loses information you might act on later. Temporary rejections are the common case here. Many servers reply "try again later" to any sender they have not seen before, which is a delay tactic, not a rejection.
 
 Two extra flags are reported alongside the status. `role` marks addresses like support@ or info@ that usually reach a team rather than one person. `disposable` marks throwaway mail services. Neither is a failure on its own, so they are reported separately and you decide what they mean for your use.
@@ -135,6 +137,36 @@ The command exits with status 1 if any address came back invalid, and 0 otherwis
 Addresses are grouped by domain before anything happens. Each domain gets one connection, and the addresses on it are checked one after another over that connection. Domains are handled in parallel, up to `--workers`.
 
 This matters for two reasons. Opening a separate connection for every address on the same domain is the fastest way to get your IP address refused. And when a domain turns out to be catch-all, mailprobe finds that out once and marks every address on it as risky without probing them individually.
+
+## What it can and cannot check
+
+This was measured by asking each provider about an address that exists and one that does not, from a home broadband connection. Your results will differ, and the section below explains why.
+
+| Provider | What happens |
+|---|---|
+| Gmail, Proton, Zoho, Figma | Answers honestly. Confirms real mailboxes, rejects fake ones. |
+| Outlook, Hotmail, Yahoo, AOL, Apple | Closes the connection. No answer is possible. |
+| Google Workspace on a company domain, Stripe, SendGrid, Cloudflare, Shopify | Catch-all. Accepts everything, so no address can be confirmed. |
+| Microsoft 365, iCloud | Refused the sender, not the address. See below. |
+
+The short version: business domains often answer, consumer mail from Microsoft, Yahoo and Apple mostly does not, and a good share of company domains are catch-all. A tool that reports confident results for all of these is not checking what it claims to check.
+
+## Your IP address changes the answers
+
+Mail servers decide whether to talk to you based on where you are connecting from. Home and office connections are listed on anti-spam blocklists as a matter of routine, because that is where compromised machines live. This is normal and does not mean anything is wrong with your connection.
+
+When a server refuses you, it answers with the same `550` it uses for a missing mailbox:
+
+```
+550 5.7.1 Service unavailable, Client host [203.0.113.10] blocked using Spamhaus
+550 5.1.1 The email account that you tried to reach does not exist
+```
+
+The first is about you. The second is about the address. Reading only the `550` makes a working address look dead, which is how a list cleaner deletes real customers.
+
+mailprobe reads the second code, the `5.7.1` or `5.1.1` part, which the mail standard defines for exactly this purpose. A `5.7.x` or `5.4.x` refusal is reported as `unknown` with an explanation, never as `invalid`. The server's own words are passed through in `detail` so you can see the blocklist name and check it yourself.
+
+What this means in practice: from a blocklisted connection you will see more `unknown` results and fewer confident ones. That is the tool working correctly. If you need answers for those domains, you need to check from an IP address with a clean sending reputation, which usually means a mail server you already run.
 
 ## Things worth knowing before you rely on this
 

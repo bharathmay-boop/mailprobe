@@ -22,8 +22,10 @@ from mailprobe import (
     _split,
     decide,
     default_from_address,
+    first_line,
     format_error,
     helo_name,
+    rejected_the_sender,
     main,
     make_handler,
     verify,
@@ -84,6 +86,56 @@ def test_temporary_rejection_is_unknown():
     """Greylisting is not a rejection, and calling it one loses real addresses."""
     for code in (450, 451, 421):
         assert decide(code, False, False)[0] == UNKNOWN
+
+
+def test_blocklist_rejection_is_not_reported_as_a_bad_address():
+    """The bug this guards against deleted working addresses.
+
+    A server that has our IP address on a blocklist answers 550, the same
+    code it uses for a missing mailbox. Only the enhanced code tells them
+    apart. Reading just the 550 marked good addresses invalid.
+    """
+    real_replies = [
+        "5.7.1 Service unavailable, Client host [203.0.113.10] blocked using Spamhaus",
+        "5.7.1 Mail from IP 203.0.113.10 was rejected due to listing in Spamhaus SBL",
+        "5.7.606 Access denied, banned sending IP",
+    ]
+    for reply in real_replies:
+        status, reason = decide(550, False, False, reply)
+        assert status == UNKNOWN, f"{reply!r} must not be reported as invalid"
+        assert "blocklist" in reason
+
+
+def test_routing_rejection_is_also_not_about_the_address():
+    assert decide(550, False, False, "5.4.4 Unable to route")[0] == UNKNOWN
+
+
+def test_a_genuinely_missing_mailbox_is_still_invalid():
+    """The fix must not make the tool useless by calling everything unknown."""
+    gmail = "5.1.1 The email account that you tried to reach does not exist"
+    status, _ = decide(550, False, False, gmail)
+    assert status == INVALID
+
+    # Servers that send no enhanced code at all are still trusted.
+    assert decide(550, False, False, "User unknown")[0] == INVALID
+    assert decide(550, False, False, "")[0] == INVALID
+
+
+def test_sender_rejection_is_detected_from_the_enhanced_code_only():
+    assert rejected_the_sender("5.7.1 blocked")
+    assert rejected_the_sender("4.4.1 no route")
+    assert not rejected_the_sender("5.1.1 no such user")
+    assert not rejected_the_sender("5.2.2 mailbox full")
+    assert not rejected_the_sender("")
+    # The words alone must not trigger it, or a mailbox named after a
+    # blocklist would be misread.
+    assert not rejected_the_sender("5.1.1 no such user spamhaus blocked")
+
+
+def test_server_words_are_kept_but_trimmed():
+    assert first_line("5.7.1 blocked\nsecond line") == "5.7.1 blocked"
+    assert len(first_line("x" * 500)) <= 200
+    assert first_line("") == ""
 
 
 def test_dropped_connection_is_unknown_not_invalid():
