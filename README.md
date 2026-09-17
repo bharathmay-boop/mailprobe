@@ -2,15 +2,15 @@
 
 [![tests](https://github.com/bharathmay-boop/mailprobe/actions/workflows/test.yml/badge.svg)](https://github.com/bharathmay-boop/mailprobe/actions/workflows/test.yml)
 
-Check whether an email address can actually receive mail, and say "unknown" when that cannot be determined.
+Check whether an email address can actually receive mail, and say so plainly when that cannot be worked out.
 
 ## The problem
 
-Most email checkers only look at the shape of the address. They confirm there is text, an @ sign, and a domain, then report the address as valid. That check passes for addresses that will bounce the moment you send to them.
+Most email checkers only look at the shape of an address. They see some text, an @ sign and a domain name, and call it valid. That test passes for addresses that will bounce the moment you send to them.
 
-The tools that go further have a second problem. Many domains are configured to accept every address offered to them, a setup called catch-all. On those domains, asking the mail server whether a mailbox exists always returns yes. Plenty of verifiers take that yes at face value and report the address as valid.
+The checkers that go further run into a second problem. Many domains are set up to accept every address offered to them, which is called a catch-all. On those domains, asking whether a mailbox exists always comes back yes. A lot of tools take that yes at face value and report the address as valid.
 
-Here is what that looks like in practice. These three addresses are invented, and every one of them is accepted by the receiving server:
+These three addresses were made up on the spot. Every one of them is accepted by the receiving server:
 
 ```
 $ mailprobe zzq7x2random@sendgrid.com,zzq7x2random@cloudflare.com,zzq7x2random@shopify.com
@@ -20,33 +20,36 @@ zzq7x2random@cloudflare.com  risky  server accepts every address on this domain,
 zzq7x2random@shopify.com     risky  server accepts every address on this domain, so this mailbox cannot be confirmed
 ```
 
-A checker that reports those as valid is not verifying anything. It is guessing, and passing the guess off as a result.
+A tool that calls those valid is not checking anything. It is guessing, and presenting the guess as a result.
 
-## What this does instead
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results-dark.png">
+  <img alt="mailprobe checking six addresses, showing valid, invalid and risky results with the mail server reply under each one" src="docs/results.png">
+</picture>
 
-mailprobe runs four checks in order and stops as soon as it has a definite answer.
+## What it checks
 
-1. Format. Does the address follow the rules for a real address, including the length limits.
-2. Mail server. Does the domain publish a mail server. If there is no MX record it falls back to the domain's A record, which the mail standard allows and many small domains depend on.
-3. Mailbox. It opens a conversation with the mail server and asks about the address, then disconnects. No mail is ever sent.
-4. Catch-all. It asks the same server about a randomly generated address that cannot exist. If the server accepts that one too, the answer to question 3 was meaningless, and the result is reported as risky rather than valid.
+Four steps, stopping as soon as there is a clear answer.
 
-## Results
+1. **Shape.** Does the address follow the rules, including the length limits.
+2. **Mail server.** Does the domain publish one. If it does not, mailprobe falls back to the domain itself, which the mail standard allows and many small domains rely on.
+3. **Mailbox.** It starts a conversation with the mail server and asks about the address, then disconnects. No mail is ever sent.
+4. **Catch-all.** Before asking about your address, it asks about a made up one that cannot exist. If the server accepts that, its answers carry no information, and your address is reported as risky rather than valid.
 
-| Status | Meaning |
+## What the results mean
+
+| Result | Meaning |
 |---|---|
-| `valid` | The server confirmed this mailbox exists and does not accept every address. |
-| `invalid` | The format is wrong, the domain has no mail server, or the server rejected the address outright. |
-| `risky` | The address may work, but it cannot be confirmed. Catch-all domains and throwaway mail services land here. |
-| `unknown` | The server would not answer. It asked us to retry later, hung up, or could not be reached. |
+| `valid` | The server confirmed this mailbox exists, and it does not accept every address. |
+| `invalid` | The shape is wrong, the domain has no mail server, or the server turned the address down. |
+| `risky` | It may work, but it cannot be confirmed. Catch-all domains and throwaway mail services land here. |
+| `unknown` | The server would not answer. It asked us to come back later, hung up, or turned us away. |
+
+`unknown` is there on purpose. A server that refuses to answer has told you nothing, and filing that as either valid or invalid throws away the fact that you still do not know. The most common case is a server replying "try again later" to any sender it has not seen before, which is a delaying tactic rather than a rejection.
 
 Every result also carries `detail`, which is the mail server's own reply, so you can check the tool's reading against what was actually said.
 
-The `unknown` status is deliberate. A server that refuses to answer has told you nothing, and recording that as either valid or invalid loses information you might act on later. Temporary rejections are the common case here. Many servers reply "try again later" to any sender they have not seen before, which is a delay tactic, not a rejection.
-
-Two extra flags are reported alongside the status. `role` marks addresses like support@ or info@ that usually reach a team rather than one person. `disposable` marks throwaway mail services. Neither is a failure on its own, so they are reported separately and you decide what they mean for your use.
-
-![The browser interface, showing all four result types](docs/screenshot.png)
+Two extra labels appear next to the result. `role` marks addresses like support@ or info@ that usually reach a team rather than one person. `disposable` marks throwaway mail services. Neither is a problem on its own, so they are kept separate from the result and you decide what they mean for your use.
 
 ## Install
 
@@ -56,9 +59,9 @@ cd mailprobe
 pip install .
 ```
 
-Python 3.9 or newer. The only dependency is dnspython, used for the mail server lookup. The tests run against 3.9, 3.11, and 3.13.
+Python 3.9 or newer. One dependency, dnspython, used to look up mail servers. Tested on 3.9, 3.11 and 3.13.
 
-## Set your sending address first
+## Set your sending address
 
 Before checking anything, tell mailprobe who to say it is. Mail servers ask, and the answer changes how they treat you.
 
@@ -66,38 +69,52 @@ Before checking anything, tell mailprobe who to say it is. Mail servers ask, and
 export MAILPROBE_FROM="checks@yourdomain.com"
 ```
 
-Put that in your shell profile so it sticks. On Windows PowerShell:
+On Windows PowerShell:
 
 ```powershell
 setx MAILPROBE_FROM "checks@yourdomain.com"
 ```
 
-Use a domain you actually own. Nothing is sent from it and no mailbox needs to exist behind it, but the domain itself should be real, because the receiving server may check that it resolves. You can also pass `--from-address` on any single run, which overrides the variable.
+Use a domain you own. Nothing is sent from it and no mailbox needs to sit behind it, but the domain should be real, because the receiving server may look it up. You can also pass `--from-address` on a single run to override it.
 
-If you skip this, mailprobe falls back to `verify@example.com` and prints a reminder. That fallback works against some servers and is refused by others, so results will be worse and less consistent. The reminder can be silenced with `--quiet` once you understand the tradeoff.
+Skip this and mailprobe falls back to `verify@example.com` and prints a reminder. That fallback works with some servers and is turned away by others, so results will be patchier. Silence the reminder with `--quiet` once you know the tradeoff.
 
-## Use
+## Use it
 
-Check one address, or several separated by commas:
+### In a browser
+
+```bash
+mailprobe --serve
+```
+
+This opens a page on your own machine. Paste in a list, press Check, and the results fill in below.
+
+![The mailprobe page when it opens, with an empty box for addresses](docs/empty.png)
+
+The page is tied to your machine only and cannot be reached from the rest of your network. It is built in, so there is nothing more to install. Use `--port` to pick a different port and `--no-browser` to stop it opening a window.
+
+### From the command line
+
+One address, or several separated by commas:
 
 ```bash
 mailprobe someone@example.com
 mailprobe "first@example.com,second@example.com"
 ```
 
-Read a list from a file, one address per line:
+Read a list from a file, one per line:
 
 ```bash
 cat addresses.txt | mailprobe
 ```
 
-Get JSON back for use in another program:
+Get JSON back for another program to read:
 
 ```bash
 mailprobe --json someone@example.com
 ```
 
-From Python:
+### From Python
 
 ```python
 from mailprobe import verify
@@ -106,83 +123,69 @@ result = verify("someone@example.com")
 print(result.status, result.reason)
 ```
 
-### In a browser
-
-```bash
-mailprobe --serve
-```
-
-This starts a small interface on your own machine and opens it, as shown in the picture above. Paste in a list, press Check, and the results appear in a table. Use `--port` to pick a different port, and `--no-browser` to stop it opening a window.
-
-The interface is deliberately bound to localhost, so it is reachable from your machine only and not from the rest of your network. It is built into the tool and needs nothing beyond what the install already gave you.
-
-### Options
+## Options
 
 | Option | Default | What it does |
 |---|---|---|
-| `--from-address` | `MAILPROBE_FROM`, else `verify@example.com` | The address used to introduce ourselves to the mail server. Set this to a domain you own. |
-| `--timeout` | `10` | Seconds to wait for each step. The DNS lookup and the mail server conversation are separate steps, so a single address can take up to twice this. |
+| `--from-address` | `MAILPROBE_FROM`, else `verify@example.com` | Who we say we are. Use a domain you own. |
+| `--timeout` | `10` | Seconds to wait for each step. Looking up the mail server and talking to it are separate steps, so one address can take up to twice this. |
 | `--workers` | `5` | How many domains to check at the same time. |
-| `--json` | off | Print results as JSON, on standard output. Warnings go to standard error, so piping to a JSON reader stays clean. |
-| `--serve` | off | Open the browser interface on this machine. |
+| `--json` | off | Print results as JSON on standard output. Warnings go to standard error, so piping into a JSON reader stays clean. |
+| `--serve` | off | Open the page on your machine. |
 | `--port` | `8765` | Port for `--serve`. |
 | `--no-browser` | off | With `--serve`, do not open a browser window. |
 | `--quiet` | off | Do not print the reminder about the sending address. |
 | `--version` | | Print the version and exit. |
 
-The command exits with status 1 if any address came back invalid, and 0 otherwise, which is useful in scripts.
+The command exits with status 1 if any address came back invalid, and 0 otherwise, which is handy in scripts.
 
 ## How it handles a list
 
-Addresses are grouped by domain before anything happens. Each domain gets one connection, and the addresses on it are checked one after another over that connection. Domains are handled in parallel, up to `--workers`.
+Addresses are grouped by domain first. Each domain gets one connection, and its addresses are checked one after another over that connection. Different domains are handled at the same time, up to `--workers`.
 
-This matters for two reasons. Opening a separate connection for every address on the same domain is the fastest way to get your IP address refused. And when a domain turns out to be catch-all, mailprobe finds that out once and marks every address on it as risky without probing them individually.
+This matters for two reasons. Opening a separate connection for every address at the same company is the quickest way to get your IP address turned away. And when a domain turns out to be catch-all, mailprobe works that out once and marks every address on it as risky without asking about them one by one.
 
 ## What it can and cannot check
 
-This was measured by asking each provider about an address that exists and one that does not, from a home broadband connection. Your results will differ, and the section below explains why.
+Measured by asking each provider about an address that exists and one that does not, from a home broadband connection. Your results will differ, and the next section explains why.
 
 | Provider | What happens |
 |---|---|
-| Gmail, Proton, Zoho, Figma | Answers honestly. Confirms real mailboxes, rejects fake ones. |
-| Outlook, Hotmail, Yahoo, AOL, Apple | Closes the connection. No answer is possible. |
-| Google Workspace on a company domain, Stripe, SendGrid, Cloudflare, Shopify | Catch-all. Accepts everything, so no address can be confirmed. |
-| Microsoft 365, iCloud | Refused the sender, not the address. See below. |
+| Gmail, Proton, Zoho, Figma | Answers straight. Confirms real mailboxes, turns down made up ones. |
+| Outlook, Hotmail, Yahoo, AOL, Apple | Hangs up. No answer is possible. |
+| Google Workspace on a company domain, Stripe, SendGrid, Cloudflare, Shopify | Catch-all. Accepts everything, so nothing can be confirmed. |
+| Microsoft 365, iCloud | Turned away the sender rather than the address. See below. |
 
-The short version: business domains often answer, consumer mail from Microsoft, Yahoo and Apple mostly does not, and a good share of company domains are catch-all. A tool that reports confident results for all of these is not checking what it claims to check.
+The short version: business domains often answer, consumer mail from Microsoft, Yahoo and Apple mostly does not, and a fair share of company domains are catch-all. Any tool that reports confident results across all of these is not checking what it says it is checking.
 
-## Your IP address changes the answers
+## Where you run it changes the answers
 
-Mail servers decide whether to talk to you based on where you are connecting from. Home and office connections are listed on anti-spam blocklists as a matter of routine, because that is where compromised machines live. This is normal and does not mean anything is wrong with your connection.
+Mail servers decide whether to talk to you based on where you are connecting from. Home and office connections sit on anti-spam lists as a matter of routine, because that is where hijacked machines tend to live. This is normal and does not mean anything is wrong with your connection.
 
-When a server refuses you, it answers with the same `550` it uses for a missing mailbox:
+When a server turns you away, it uses the same `550` reply it uses for a missing mailbox:
 
 ```
 550 5.7.1 Service unavailable, Client host [203.0.113.10] blocked using Spamhaus
 550 5.1.1 The email account that you tried to reach does not exist
 ```
 
-The first is about you. The second is about the address. Reading only the `550` makes a working address look dead, which is how a list cleaner deletes real customers.
+The first is about you. The second is about the address. Reading only the `550` makes a working address look dead, which is how a list cleaner quietly deletes real customers.
 
-mailprobe reads the second code, the `5.7.1` or `5.1.1` part, which the mail standard defines for exactly this purpose. A `5.7.x` or `5.4.x` refusal is reported as `unknown` with an explanation, never as `invalid`. The server's own words are passed through in `detail` so you can see the blocklist name and check it yourself.
+mailprobe reads the second code, the `5.7.1` or `5.1.1` part, which the mail standard defines for this exact purpose. Anything in the `5.7` or `5.4` group is reported as `unknown` with an explanation, never as `invalid`. The server's own words are passed through in `detail` so you can see which list you are on and check it yourself.
 
-What this means in practice: from a blocklisted connection you will see more `unknown` results and fewer confident ones. That is the tool working correctly. If you need answers for those domains, you need to check from an IP address with a clean sending reputation, which usually means a mail server you already run.
+In practice this means that from a listed connection you will see more `unknown` results and fewer confident ones. That is the tool working correctly. For answers on those domains you need to check from an address with a clean sending reputation, which usually means a mail server you already run.
 
-## Things worth knowing before you rely on this
+## Other things worth knowing
 
-**This runs on your machine, not on a server somewhere.** Checking a mailbox means opening a connection to the receiving mail server on port 25. Home and office internet connections normally allow that, so the tool works as soon as you install it. Hosting providers are the problem: AWS, Google Cloud, Azure, Vercel, and most shared hosting block outbound port 25 by default to limit spam, and on those every check comes back `unknown`.
+**This runs on your machine, not on a server somewhere.** Checking a mailbox means connecting to the receiving mail server on port 25. Home and office connections normally allow that, so the tool works as soon as you install it. Hosting providers are the problem: AWS, Google Cloud, Azure, Vercel and most shared hosting block that port to limit spam, and on those every check comes back `unknown`. That is why there is no public demo link, and why the page runs on your own machine. If you do want it on a server, you need a host willing to unblock the port, which usually means asking support and explaining what you are doing.
 
-That is why there is no public demo link to click, and why the browser interface runs locally instead of being deployed. This is how mail works, not something the code can route around. If you do want it on a server, you need a host that will lift the port 25 block for you, which usually means asking support and explaining what you are doing.
+**Go gently on volume.** Checking thousands of addresses from one IP address in a short space of time looks like spam, and servers will start refusing you. Lower `--workers` for long lists. The browser page caps a batch at 100 for this reason. The command line does not cap you, on the assumption that if you are scripting it you know what you are taking on.
 
-**Set `MAILPROBE_FROM` to a domain you control.** Mail servers check who is asking, and mailprobe also uses that domain when it greets them. Leaving the default in place will get you turned away more often. See the section above.
+**Existing is not the same as reaching the inbox.** This tells you a mailbox is there. It says nothing about whether your mail will be delivered, and it checks none of the settings that decide that.
 
-**Go gently on volume.** Checking thousands of addresses from one IP address in a short window looks like the behaviour of a spammer, and mail servers will start refusing you. Lower `--workers` for large lists. The browser interface caps a single batch at 100 for this reason. The command line does not cap you, on the assumption that if you are scripting it you know what you are doing.
+**Addresses with non-English characters are turned down.** They are treated as bad shape rather than converted. If you need them, that conversion is the piece to add.
 
-**Addresses with non-English characters are rejected.** Internationalised addresses and domains are treated as bad format rather than being converted. If you need them, that conversion is the piece to add.
-
-**Large providers vary.** Gmail answers honestly about whether a mailbox exists. Some other large providers accept everything at this stage and reject later, which means an honest result for them is `risky`, not `valid`. That is the correct answer, not a gap.
-
-**The throwaway domain list is a starter set.** It covers the services that show up most often. If you need full coverage, the [disposable-email-domains](https://github.com/disposable-email-domains/disposable-email-domains) project maintains a much longer list you can load in.
+**The throwaway domain list is a starter set.** It covers the services that turn up most often. For fuller coverage, the [disposable-email-domains](https://github.com/disposable-email-domains/disposable-email-domains) project keeps a much longer list you can load in.
 
 ## Running the tests
 
@@ -190,9 +193,9 @@ That is why there is no public demo link to click, and why the browser interface
 python test_mailprobe.py
 ```
 
-The tests cover address format rules, how server replies map to a status, the greeting name, and the local web interface. None of them send traffic to a mail server, so they pass anywhere, including on build machines where port 25 is blocked.
+The tests cover the shape rules, how server replies turn into a result, the name we greet servers with, and the local page. None of them send traffic to a mail server, so they pass anywhere, including on build machines where port 25 is blocked.
 
-They run on plain asserts with no test framework, so there is nothing extra to install.
+They use plain asserts with no test framework, so there is nothing extra to install.
 
 ## Licence
 
